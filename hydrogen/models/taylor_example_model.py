@@ -2,6 +2,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 class RMM_NN_2D_B1(pl.LightningModule):
 
@@ -69,16 +70,19 @@ class RMM_NN_2D_B1(pl.LightningModule):
     def forward(self, x):
         return self.model(x)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=1e-3)
+    def configure_optimizers(self, opt=torch.optim.Adam, **kwargs):
+        optimizer = opt(self.parameters(), **kwargs)
         return optimizer
+
+    def configure_loss(self, loss=F.mse_loss):
+        self.loss = loss
 
     def training_step(self, train_batch, batch_idx):
         x, y = train_batch
         x = x.view(x.size(0), -1)
         z = self.encoder(x)
         x_hat = self.decoder(z)
-        loss = F.mse_loss(x_hat, x)
+        loss = self.loss(x_hat, x)
         self.log('train_loss', loss)
         return loss
 
@@ -89,3 +93,14 @@ class RMM_NN_2D_B1(pl.LightningModule):
         x_hat = self.decoder(z)
         loss = F.mse_loss(x_hat, x)
         self.log('val_loss', loss)
+
+
+    @property
+    def shape(self):
+        #TODO
+        return (10, 10)
+
+    @property
+    def feature_names(self):
+        #TODO
+        return ([], [])
