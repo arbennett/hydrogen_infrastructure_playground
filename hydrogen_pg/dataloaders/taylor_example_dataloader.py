@@ -3,9 +3,10 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import xarray as xr
+from hydrogen.transform import float32_clamp_scaling
 from sklearn.preprocessing import MinMaxScaler
-from torch.utils.data import Dataset, DataLoader
-from typing import Optional, Union, List
+from torch.utils.data import Dataset, DataLoader, random_split
+from typing import Optional, Union, List, Mapping
 
 from . import mixins
 
@@ -47,6 +48,14 @@ SCALING = {
     # 'flow':((0.0,538353.0964431178),(0,1))
 }
 
+
+Z_REDUCERS = {
+        'mean': lambda x: x.mean(dim='z'),
+        'median': lambda x: x.median(dim='z'),
+        'sum': lambda x: x.sum(dim='z'),
+}
+
+
 class Conv2dDataset(Dataset, mixins.ScalerMixin):
     """
     TODO: Move the scale transforms to the ScalerMixin for real
@@ -57,6 +66,7 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         filename_or_obj: Union[List[str], str, xr.Dataset],
         in_vars: Union[List[str], str],
         out_vars: Union[List[str], str],
+        z_strategy: Union[str, int]=None,
         # patch_sizes: Mapping[str, int]={}, # TODO: This will allow for patching out samples
         dtype: torch.dtype=torch.float32,
         read_parallel: bool=False
@@ -73,17 +83,18 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         self.input_vars = in_vars if isinstance(in_vars, List) else [in_vars]
         self.target_vars = out_vars if isinstance(out_vars, List) else [out_vars]
         self.dtype = dtype
+        self.z_strategy = z_strategy
         self._gen_scalers()
 
     def _gen_scalers(self):
-        """TODO: Make work for nd-arrays"""
+        """TODO: Make an interface which is serializable like sklearn"""
         self.scalers = {}
         for v in self.input_vars + self.target_vars:
-            in_range, out_range = SCALING[v]
-            scaler = MinMaxScaler(feature_range=out_range)
-            scaler.min_, scaler.max_ = in_range
-            scaler.scale_ = in_range[1] - in_range[0]
-            self.scalers[v] = scaler
+            src_range, dst_range = SCALING[v]
+            #scaler = MinMaxScaler(feature_range=out_range)
+            #scaler.min_, scaler.max_ = in_range
+            #scaler.scale_ = in_range[1] - in_range[0]
+            self.scalers[v] = float32_clamp_scaling(src_range, dst_range)
 
     def _gen_patches(self):
         """
@@ -110,23 +121,51 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         # The number of samples in the dataset
         return len(self.ds['time']) - 1
 
+    def _require_z_strategy(self):
+        have_z_strategy = self.z_strategy is not None
+        need_z_strategy = False
+        for v in self.input_vars + self.target_vars:
+            if 'z' in self.ds[v].dims:
+                need_z_strategy = True
+                break
+
+        if need_z_strategy and not have_z_strategy:
+            raise RuntimeError(
+                    "You have a z dimension in your input/output variables, "
+                    "but have not specified a valid z_strategy to handle this!")
+        return need_z_strategy
+
+    def _reduce_along_z(self, input_ds, output_ds):
+        if self._require_z_strategy():
+            if isinstance(self.z_strategy, int):
+                if 'z' in input_ds.dims:
+                    input_ds = input_ds.isel(z=self.z_strategy)
+                if 'z' in output_ds.dims:
+                    output_ds = output_ds.isel(z=self.z_strategy)
+            elif isinstance(self.z_strategy, str):
+                reducer = Z_REDUCERS[self.z_strategy]
+                if 'z' in input_ds:
+                    input_ds = reducer(input_ds)
+                if 'z' in output_ds:
+                    output_ds = reducer(output_ds)
+        return input_ds, output_ds
 
     def __getitem__(self, idx):
         # Get an individual sample
         all_vars = self.input_vars + self.target_vars
         input_ds = self.ds.isel(time=idx)[self.input_vars]
         output_ds = self.ds.isel(time=idx+1)[self.target_vars]
+        input_ds, output_ds = self._reduce_along_z(input_ds, output_ds)
 
         # Scale as necessary
         X, y = [], []
         for v in self.input_vars:
-            X.append(self.scalers[v].transform(input_ds[v].values))
-
+            X.append(self.scalers[v](input_ds[v].values))
         for v in self.target_vars:
-            y.append(self.scalers[v].transform(output_ds[v].values))
+            y.append(self.scalers[v](output_ds[v].values))
 
-        X = torch.from_numpy(np.hstack(X), dtype=self.dtype)
-        y = torch.from_numpy(np.hstack(y), dtype=self.dtype)
+        X = torch.from_numpy(np.stack(X)).type(self.dtype)
+        y = torch.from_numpy(np.stack(y)).type(self.dtype)
         return X, y
 
 
@@ -137,43 +176,65 @@ class Conv2dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
         pfidb_or_pfmetadata_file: Union[List[str], str],
         in_vars: Union[List[str], str],
         out_vars: Union[List[str], str],
-        scalers: Optional[Union[str, dict]]=None,
+        z_strategy: Union[str, int]=None,
+        train_frac: float=0.7,
         batch_size: int=256
     ):
         super().__init__()
+        self.in_vars = in_vars
+        self.out_vars = out_vars
+        self.train_frac = train_frac
+        self.z_strategy = z_strategy
         self.pfidb_or_pfmetadata_file = pfidb_or_pfmetadata_file
         self.batch_size = batch_size
+        self._shape = None
 
 
     def setup(self, stage: Optional[str] = None):
-
         if stage in (None, 'fit'):
-            pass
-
-        if stage in (None, 'train'):
-            pass
+            conv2d_full = Conv2dDataset(
+                    self.pfidb_or_pfmetadata_file,
+                    in_vars=self.in_vars,
+                    out_vars=self.out_vars,
+                    z_strategy=self.z_strategy)
+            full_size = len(conv2d_full)
+            n_train = int(self.train_frac * full_size)
+            n_val = full_size - n_train
+            self.dataset_train, self.dataset_val = random_split(
+                    conv2d_full, [n_train, n_val])
 
         if stage in (None, 'test'):
-            pass
+            self.dataset_test = Conv2dDataset(
+                    self.pfidb_or_pfmetadata_file,
+                    in_vars=self.in_vars,
+                    out_vars=self.out_vars,
+                    z_strategy=self.z_strategy)
+
 
     def train_dataloader(self):
-        pass
+        return DataLoader(self.dataset_train, batch_size=self.batch_size)
 
     def val_dataloader(self):
-        pass
+        return DataLoader(self.dataset_val, batch_size=self.batch_size)
 
     def test_dataloader(self):
-        pass
+        return DataLoader(self.dataset_test, batch_size=self.batch_size)
 
     def teardown(self, stage: Optional[str] = None):
         pass
 
     @property
     def shape(self):
-        #TODO
-        return (10, 10)
+        if not self._shape:
+            if isinstance(self.pfidb_or_pfmetadata_file, List):
+                f = self.pfidb_or_pfmetadata_file[0]
+            else:
+                f = self.pfidb_or_pfmetadata_file
+            with xr.open_dataset(f) as ds:
+                x, y = len(ds['y']), len(ds['x'])
+            self._shape = (x,y)
+        return self._shape
 
     @property
     def feature_names(self):
-        #TODO
-        return ([], [])
+        return (self.in_vars, self.out_vars)

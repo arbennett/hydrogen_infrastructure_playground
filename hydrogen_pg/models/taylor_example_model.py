@@ -3,16 +3,26 @@ import pytorch_lightning as pl
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import Optional, Union, List, Mapping
 
 class RMM_NN_2D_B1(pl.LightningModule):
 
-    def __init__(self, grid_size=[25, 25],  channels=2, verbose=False,):
+    def __init__(
+            self,
+            grid_size=[25, 25],
+            in_vars=List[str],
+            out_vars=List[str],
+            verbose=False,
+    ):
         super().__init__()
         self.use_dropout = False
+        self.grid_size = grid_size
         self.verbose = verbose
+        self.in_vars = in_vars
+        self.out_vars = out_vars
 
         # Inputs Parameters
-        Cin = channels
+        Cin = len(in_vars)
         Hin = grid_size[0]
         Win = grid_size[1]
         in_shape = [Cin, Hin, Win]
@@ -46,7 +56,7 @@ class RMM_NN_2D_B1(pl.LightningModule):
                 kernel_size=cnv_kernel_size,
                 stride=cnv_stride,
                 padding=cnv_padding
-            ).float(),
+            ),
             nn.ReLU(),
             nn.MaxPool2d(
                 kernel_size=pool_kernel_size,
@@ -58,49 +68,44 @@ class RMM_NN_2D_B1(pl.LightningModule):
                 kernel_size=cnv_kernel_size,
                 stride=cnv_stride,
                 padding=cnv_padding
-            ).float(),
+            ),
             nn.ReLU(),
             nn.MaxPool2d(
                 kernel_size=pool_kernel_size,
                 stride=pool_stride),
+            nn.Flatten(),
             nn.LazyLinear(L_Fout1),
             nn.Linear(L_Fout1, L_Fout2)
         )
 
     def forward(self, x):
-        return self.model(x)
+        return self.model(x).view((-1, *self.grid_size))
 
     def configure_optimizers(self, opt=torch.optim.Adam, **kwargs):
-        optimizer = opt(self.parameters(), **kwargs)
+        optimizer = opt(self.model.parameters(), **kwargs)
         return optimizer
 
-    def configure_loss(self, loss=F.mse_loss):
-        self.loss = loss
+    def configure_loss(self, loss_fun=F.mse_loss):
+        self.loss_fun = loss_fun
 
-    def training_step(self, train_batch, batch_idx):
+    def training_step(self, train_batch, train_batch_idx):
         x, y = train_batch
-        x = x.view(x.size(0), -1)
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        loss = self.loss(x_hat, x)
+        y_hat = self.model(x).view((-1, *self.grid_size))
+        loss = self.loss_fun(y_hat, y)
         self.log('train_loss', loss)
         return loss
 
-    def validation_step(self, val_batch, batch_idx):
+    def validation_step(self, val_batch, val_batch_idx):
         x, y = val_batch
-        x = x.view(x.size(0), -1)
-        z = self.encoder(x)
-        x_hat = self.decoder(z)
-        loss = F.mse_loss(x_hat, x)
+        y_hat = self.model(x).view((-1, 1, *self.grid_size))
+        loss = self.loss_fun(y_hat, y)
         self.log('val_loss', loss)
-
+        return loss
 
     @property
     def shape(self):
-        #TODO
-        return (10, 10)
+        return self.grid_size
 
     @property
     def feature_names(self):
-        #TODO
-        return ([], [])
+        return self.in_vars, self.out_vars
