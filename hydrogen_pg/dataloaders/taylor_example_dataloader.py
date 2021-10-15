@@ -67,24 +67,47 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         in_vars: Union[List[str], str],
         out_vars: Union[List[str], str],
         z_strategy: Union[str, int]=None,
-        # patch_sizes: Mapping[str, int]={}, # TODO: This will allow for patching out samples
+        patch_sizes: Mapping[str, int]={},
         dtype: torch.dtype=torch.float32,
         read_parallel: bool=False
     ):
         super().__init__()
+        self.input_vars = in_vars if isinstance(in_vars, List) else [in_vars]
+        self.target_vars = out_vars if isinstance(out_vars, List) else [out_vars]
+        self.all_vars = self.input_vars + self.target_vars
+        read_vars = self._disambiguate_component_vars(self.all_vars)
         if isinstance(filename_or_obj, List):
             self.ds = xr.open_mfdataset(
-                    filename_or_obj, concat_dim='time', parallel=read_parallel)
+                          filename_or_obj,
+                          combine='nested',
+                          concat_dim='time',
+                          parallel=read_parallel,
+                          read_inputs=read_vars,
+                          read_outputs=read_vars
+            )
         elif isinstance(filename_or_obj, str):
-            self.ds = xr.open_dataset(filename_or_obj)
+            self.ds = xr.open_dataset(
+                          filename_or_obj,
+                          read_inputs=read_vars,
+                          read_outputs=read_vars
+            )
         elif isinstance(filename_or_obj, xr.Dataset):
             self.ds = filename_or_obj
 
-        self.input_vars = in_vars if isinstance(in_vars, List) else [in_vars]
-        self.target_vars = out_vars if isinstance(out_vars, List) else [out_vars]
         self.dtype = dtype
         self.z_strategy = z_strategy
+        if patch_sizes:
+            self.patch_sizes = patch_sizes
+            self.patches = self._gen_patches()
+            self.n_patches = len(self.patches)
+        else:
+            # Single patch that covers the entire domain
+            self.patches = [{'x': slice(0, None), 'y': slice(0, None)}]
+            self.n_patches = 1
         self._gen_scalers()
+
+    def _disambiguate_component_vars(self, var_list):
+        return list(set([v.split('_')[0] for v in var_list]))
 
     def _gen_scalers(self):
         """TODO: Make an interface which is serializable like sklearn"""
@@ -105,7 +128,7 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         patch_binner = {}
         patch_groups = {}
         for k, v in self.patch_sizes.items():
-            patch_binner[k] = self.ds[k].isel(slice(0, None, v))
+            patch_binner[k] = self.ds[k].isel({k: slice(0, None, v)})
             patch_groups[k] = self.ds[k].groupby_bins(k, patch_binner[k])
 
         # Could this be more efficient?
@@ -113,13 +136,14 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         for sub_patch in itertools.product(*patch_groups.values()):
             _patch = {}
             for i, k in enumerate(self.patch_sizes.keys()):
-                _patch[k] = sub_patch[i][-1]
+                _patch[k] = sub_patch[i][-1].astype(int)
+            #yield _patch  # <- TODO: Can we figure out how to make this a generator?
             patches.append(_patch)
         return patches
 
     def __len__(self):
         # The number of samples in the dataset
-        return len(self.ds['time']) - 1
+        return (len(self.ds['time']) - 1) * len(self.patches)
 
     def _require_z_strategy(self):
         have_z_strategy = self.z_strategy is not None
@@ -152,9 +176,16 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
 
     def __getitem__(self, idx):
         # Get an individual sample
+
+        patch_idx = idx % self.n_patches
+        time_idx = idx // self.n_patches
         all_vars = self.input_vars + self.target_vars
-        input_ds = self.ds.isel(time=idx)[self.input_vars]
-        output_ds = self.ds.isel(time=idx+1)[self.target_vars]
+        input_ds = self.ds.isel(
+                       {'time': time_idx, **self.patches[patch_idx]}
+        )[self.input_vars]
+        output_ds = self.ds.isel(
+                        {'time': time_idx+1, **self.patches[patch_idx]}
+        )[self.target_vars]
         input_ds, output_ds = self._reduce_along_z(input_ds, output_ds)
 
         # Scale as necessary
