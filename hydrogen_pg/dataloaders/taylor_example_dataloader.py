@@ -68,8 +68,11 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         out_vars: Union[List[str], str],
         z_strategy: Union[str, int]=None,
         patch_sizes: Mapping[str, int]={},
+        max_patches: int=None,
         dtype: torch.dtype=torch.float32,
-        read_parallel: bool=False
+        read_parallel: bool=False,
+        dataset_chunks: Mapping[str, int]={'time': 1},
+        raw_isel_args: Mapping[str, int]={}
     ):
         super().__init__()
         self.input_vars = in_vars if isinstance(in_vars, List) else [in_vars]
@@ -83,16 +86,17 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
                           concat_dim='time',
                           parallel=read_parallel,
                           read_inputs=read_vars,
-                          read_outputs=read_vars
-            )
+                          read_outputs=read_vars,
+                          chunks=dataset_chunks
+            ).isel(raw_isel_args)
         elif isinstance(filename_or_obj, str):
             self.ds = xr.open_dataset(
                           filename_or_obj,
                           read_inputs=read_vars,
                           read_outputs=read_vars
-            )
+            ).isel(raw_isel_args)
         elif isinstance(filename_or_obj, xr.Dataset):
-            self.ds = filename_or_obj
+            self.ds = filename_or_obj.isel(raw_isel_args)
 
         self.dtype = dtype
         self.z_strategy = z_strategy
@@ -102,9 +106,13 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
             self.n_patches = len(self.patches)
         else:
             # Single patch that covers the entire domain
-            self.patches = [{'x': slice(0, None), 'y': slice(0, None)}]
+            self.patches = np.array([{'x': slice(0, None), 'y': slice(0, None)}])
             self.n_patches = 1
+        if max_patches:
+            self.n_patches = np.min([max_patches, self.n_patches])
+            self.patches = self.patches[0:self.n_patches]
         self._gen_scalers()
+        self.current_batch = None
 
     def _disambiguate_component_vars(self, var_list):
         return list(set([v.split('_')[0] for v in var_list]))
@@ -136,10 +144,10 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
         for sub_patch in itertools.product(*patch_groups.values()):
             _patch = {}
             for i, k in enumerate(self.patch_sizes.keys()):
-                _patch[k] = sub_patch[i][-1].astype(int)
+                _patch[k] = sub_patch[i][-1].astype(int).values
             #yield _patch  # <- TODO: Can we figure out how to make this a generator?
             patches.append(_patch)
-        return patches
+        return np.array(patches)
 
     def __len__(self):
         # The number of samples in the dataset
@@ -174,18 +182,21 @@ class Conv2dDataset(Dataset, mixins.ScalerMixin):
                     output_ds = reducer(output_ds)
         return input_ds, output_ds
 
+    def _load_batch(self, time_idx):
+        return self.ds.isel(time=[time_idx, time_idx+1]).load()
+
     def __getitem__(self, idx):
         # Get an individual sample
-
         patch_idx = idx % self.n_patches
         time_idx = idx // self.n_patches
+        if not self.current_batch:
+            self.current_batch = self._load_batch(time_idx)
+        if time_idx != self.current_batch['time'].values[0]:
+            self.current_batch = self._load_batch(time_idx)
         all_vars = self.input_vars + self.target_vars
-        input_ds = self.ds.isel(
-                       {'time': time_idx, **self.patches[patch_idx]}
-        )[self.input_vars]
-        output_ds = self.ds.isel(
-                        {'time': time_idx+1, **self.patches[patch_idx]}
-        )[self.target_vars]
+        sub_ds = self.current_batch.isel({'time': 0, **self.patches[patch_idx]}).persist()
+        input_ds = sub_ds[self.input_vars]
+        output_ds = sub_ds[self.target_vars]
         input_ds, output_ds = self._reduce_along_z(input_ds, output_ds)
 
         # Scale as necessary
@@ -208,38 +219,61 @@ class Conv2dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
         in_vars: Union[List[str], str],
         out_vars: Union[List[str], str],
         z_strategy: Union[str, int]=None,
+        patch_sizes: Mapping[str, int]={},
+        raw_isel_args: Mapping[str, int]={},
         train_frac: float=0.7,
-        batch_size: int=256
+        train_size: int=None,
+        val_size: int=None,
+        batch_size: int=256,
+        max_patches: int=None,
+        num_workers: int=0,
     ):
         super().__init__()
         self.in_vars = in_vars
         self.out_vars = out_vars
-        self.train_frac = train_frac
+        self.all_vars = in_vars + out_vars
         self.z_strategy = z_strategy
+        self.patch_sizes = patch_sizes
+        self.train_frac = train_frac
+        self.train_size = train_size
+        self.val_size = val_size
         self.pfidb_or_pfmetadata_file = pfidb_or_pfmetadata_file
         self.batch_size = batch_size
+        self.max_patches = max_patches
+        self.num_workers = num_workers
+        self.raw_isel_args = raw_isel_args
         self._shape = None
-
 
     def setup(self, stage: Optional[str] = None):
         if stage in (None, 'fit'):
-            conv2d_full = Conv2dDataset(
+            self._full = Conv2dDataset(
                     self.pfidb_or_pfmetadata_file,
                     in_vars=self.in_vars,
                     out_vars=self.out_vars,
-                    z_strategy=self.z_strategy)
-            full_size = len(conv2d_full)
+                    z_strategy=self.z_strategy,
+                    patch_sizes=self.patch_sizes,
+                    max_patches=self.max_patches,
+                    raw_isel_args=self.raw_isel_args
+            )
+            full_size = len(self._full)
             n_train = int(self.train_frac * full_size)
             n_val = full_size - n_train
+            if not self.train_size:
+                self.train_size = int(self.train_frac * full_size)
+                self.val_size = full_size - self.train_size
             self.dataset_train, self.dataset_val = random_split(
-                    conv2d_full, [n_train, n_val])
+                    self._full, [self.train_size, self.val_size])
 
         if stage in (None, 'test'):
             self.dataset_test = Conv2dDataset(
                     self.pfidb_or_pfmetadata_file,
                     in_vars=self.in_vars,
                     out_vars=self.out_vars,
-                    z_strategy=self.z_strategy)
+                    z_strategy=self.z_strategy,
+                    patch_sizes=self.patch_sizes,
+                    max_patches=self.max_patches,
+                    raw_isel_args=self.raw_isel_args
+                    )
 
 
     def train_dataloader(self):
@@ -257,13 +291,20 @@ class Conv2dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
     @property
     def shape(self):
         if not self._shape:
-            if isinstance(self.pfidb_or_pfmetadata_file, List):
-                f = self.pfidb_or_pfmetadata_file[0]
-            else:
-                f = self.pfidb_or_pfmetadata_file
-            with xr.open_dataset(f) as ds:
-                x, y = len(ds['y']), len(ds['x'])
-            self._shape = (x,y)
+            base_shape = {k: self.patch_sizes.get(k, None) for k in ('y','x')}
+            if None in list(base_shape.values()):
+                if isinstance(self.pfidb_or_pfmetadata_file, List):
+                    f = self.pfidb_or_pfmetadata_file[0]
+                else:
+                    f = self.pfidb_or_pfmetadata_file
+                with xr.open_dataset(
+                    f, read_inputs=self.all_vars, read_outputs=self.all_vars
+                ) as ds:
+                    ds_shape = len(ds['y']), len(ds['x'])
+                for v2, (k, v) in zip(ds_shape, base_shape.items()):
+                    if v is None:
+                        base_shape[k] = v2
+            self._shape = tuple(base_shape[c] for c in ('y','x'))
         return self._shape
 
     @property

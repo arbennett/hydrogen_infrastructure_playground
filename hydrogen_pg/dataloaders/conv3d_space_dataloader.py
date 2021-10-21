@@ -101,6 +101,7 @@ class Conv3dDataset(Dataset, mixins.ScalerMixin):
             self.n_patches = np.min([max_patches, self.n_patches])
             self.patches = self.patches[0:self.n_patches]
         self._gen_scalers()
+        self.current_batch = None
 
     def _disambiguate_component_vars(self, var_list):
         return list(set([v.split('_')[0] for v in var_list]))
@@ -136,15 +137,23 @@ class Conv3dDataset(Dataset, mixins.ScalerMixin):
         # The number of samples in the dataset
         return len(self.ds['time']) * len(self.patches)
 
+    def _load_batch(self, time_idx):
+        return self.ds.isel(time=[time_idx]).load()
+
     def __getitem__(self, idx):
         # Get an individual sample
 
+        if not self.current_batch:
+            self.current_batch = self._load_batch(time_idx)
+        if time_idx != self.current_batch['time'].values[0]:
+            self.current_batch = self._load_batch(time_idx)
+
         patch_idx = idx % self.n_patches
         time_idx = idx // self.n_patches
-        input_ds = self.ds.isel(
+        input_ds = self.current_batch.isel(
                        {'time': time_idx, **self.patches[patch_idx]}
         )[self.input_vars]
-        output_ds = self.ds.isel(
+        output_ds = self.current_batch.isel(
                         {'time': time_idx, **self.patches[patch_idx]}
         )[self.target_vars]
 
@@ -172,7 +181,8 @@ class Conv3dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
         train_size: int=None,
         val_size: int=None,
         batch_size: int=256,
-        max_patches: int=None
+        max_patches: int=None,
+        num_workers: int=0,
     ):
         super().__init__()
         self.in_vars = in_vars
@@ -185,6 +195,7 @@ class Conv3dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
         self.pfidb_or_pfmetadata_file = pfidb_or_pfmetadata_file
         self.batch_size = batch_size
         self.max_patches = max_patches
+        self.num_workers = num_workers
         self._shape = None
 
     def setup(self, stage: Optional[str] = None):
@@ -203,6 +214,7 @@ class Conv3dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
             self.dataset_train, self.dataset_val = random_split(
                     self._full, [self.train_size, self.val_size])
 
+
         if stage in (None, 'test'):
             self.dataset_test = Conv3dDataset(
                     self.pfidb_or_pfmetadata_file,
@@ -213,13 +225,25 @@ class Conv3dDataModule(pl.LightningDataModule, mixins.ScalerMixin):
 
 
     def train_dataloader(self):
-        return DataLoader(self.dataset_train, batch_size=self.batch_size)
+        return DataLoader(
+                self.dataset_train,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+        )
 
     def val_dataloader(self):
-        return DataLoader(self.dataset_val, batch_size=self.batch_size)
+        return DataLoader(
+                self.dataset_val,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+        )
 
     def test_dataloader(self):
-        return DataLoader(self.dataset_test, batch_size=self.batch_size)
+        return DataLoader(
+                self.dataset_test,
+                batch_size=self.batch_size,
+                num_workers=self.num_workers,
+        )
 
     def teardown(self, stage: Optional[str] = None):
         pass
